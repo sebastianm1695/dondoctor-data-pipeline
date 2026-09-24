@@ -1,69 +1,126 @@
 import os
-import sys
 import json
 import pandas as pd
-
-# Ajuste automático del PYTHONPATH a la raíz del proyecto
-DIR_RAIZ = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if DIR_RAIZ not in sys.path:
-    sys.path.insert(0, DIR_RAIZ)
-
-from src.utils.logger import obtener_logger
 from src.utils.hashing import anonimizar_pii
+from src.utils.logger import obtener_logger
 
 logger = obtener_logger("Bloque2_Transformation")
-RUTA_RAW = os.path.join(DIR_RAIZ, "data", "raw")
-RUTA_PROCESSED = os.path.join(DIR_RAIZ, "data", "processed")
 
-def ejecutar_bloque_2():
-    logger.info("Iniciando ejecución del Bloque 2 - Transformaciones y Capa Silver...")
-    os.makedirs(RUTA_PROCESSED, exist_ok=True)
+PATH_RAW = "data/raw"
+PATH_PROCESSED = "data/processed"
 
+def transformar_ips_norte():
+    file_path = os.path.join(PATH_RAW, "ips_norte_citas.csv")
+    df = pd.read_csv(file_path)
+    df["ips_origen"] = "NORTE"
+    df = df.drop_duplicates(subset=["cita_id", "ips_origen"])
+    return df
+
+def transformar_ips_sur():
+    file_path = os.path.join(PATH_RAW, "ips_sur_citas.csv")
+    df = pd.read_csv(file_path)
+    df["ips_origen"] = "SUR"
+    
+    # Anonimización criptográfica estricta de PII expuesta
+    df["documento_identidad"] = df["documento_identidad"].astype(str).apply(anonimizar_pii)
+    df["telefono"] = df["telefono"].astype(str).apply(anonimizar_pii)
+    
+    df = df.drop_duplicates(subset=["cita_id", "ips_origen"])
+    return df
+
+def transformar_ips_occidente():
+    file_path = os.path.join(PATH_RAW, "ips_occidente_citas.csv")
+    
+    # Lectura robusta manejando delimitador punto y coma (;)
     try:
-        # 1. Cargar datasets de las IPS
-        df_norte = pd.read_csv(os.path.join(RUTA_RAW, "ips_norte_citas.csv"))
-        df_sur = pd.read_csv(os.path.join(RUTA_RAW, "ips_sur_citas.csv"))
-        df_occ = pd.read_csv(os.path.join(RUTA_RAW, "ips_occidente_citas.csv"), sep=";")
+        df = pd.read_csv(file_path, sep=";")
+        if df.shape[1] == 1:
+            df = pd.read_csv(file_path, sep=None, engine="python")
+    except Exception:
+        df = pd.read_csv(file_path, sep=",", on_bad_lines="skip")
+    
+    # Homologación de esquema y nombres de columnas
+    mapeo_columnas = {
+        "id_cita": "cita_id",
+        "id_paciente": "paciente_id",
+        "edad_paciente": "edad",
+        "genero": "sexo",
+        "regimen_salud": "regimen",
+        "fecha_hora_cita": "fecha_cita",
+        "estado_cita": "estado",
+        "id_cita_origen": "cita_origen_id"
+    }
+    df = df.rename(columns=mapeo_columnas)
+    
+    # Homologación de dominios (Estados)
+    mapeo_estados = {
+        "ATD": "ATENDIDA",
+        "CAN": "CANCELADA",
+        "NAS": "NO_ASISTIO",
+        "PEND": "PENDIENTE",
+        "REAG": "REAGENDADA"
+    }
+    df["estado"] = df["estado"].replace(mapeo_estados)
+    
+    # Homologación de género / sexo
+    mapeo_sexo = {"Femenino": "F", "Masculino": "M"}
+    df["sexo"] = df["sexo"].replace(mapeo_sexo)
+    
+    # Limpieza de fechas (remover formato ISO 'T')
+    for col_fecha in ["fecha_creacion", "fecha_cita", "fecha_actualizacion"]:
+        if col_fecha in df.columns:
+            df[col_fecha] = df[col_fecha].astype(str).str.replace("T", " ")
+            
+    df["ips_origen"] = "OCCIDENTE"
+    df = df.drop_duplicates(subset=["cita_id", "ips_origen"])
+    return df
 
-        # Asignar origen a cada dataset
-        df_norte["ips_origen"] = "IPS Norte"
-        df_sur["ips_origen"] = "IPS Sur"
-        df_occ["ips_origen"] = "IPS Occidente"
+def transformar_whatsapp():
+    file_path = os.path.join(PATH_RAW, "whatsapp_eventos.jsonl")
+    registros = []
+    
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            data = json.loads(line)
+            mensaje_obj = json.loads(data.get("mensaje", "{}")) if isinstance(data.get("mensaje"), str) else data.get("mensaje", {})
+            contexto_obj = json.loads(data.get("contexto", "{}")) if isinstance(data.get("contexto"), str) else data.get("contexto", {})
+            
+            destinatario_raw = mensaje_obj.get("destinatario", "")
+            destinatario_hash = anonimizar_pii(destinatario_raw) if destinatario_raw else None
+            
+            registros.append({
+                "evento_id": data.get("_id"),
+                "timestamp_ms": data.get("ts"),
+                "tipo_evento": data.get("tipo"),
+                "destinatario_hash": destinatario_hash,
+                "plantilla": mensaje_obj.get("plantilla"),
+                "ips": contexto_obj.get("ips"),
+                "ref_cita": contexto_obj.get("ref_cita")
+            })
+            
+    df_wa = pd.DataFrame(registros)
+    df_wa = df_wa.drop_duplicates(subset=["evento_id"])
+    return df_wa
 
-        # 2. Unificar esquemas y estandarizar columnas
-        # Unificación de dataframes de citas
-        df_citas = pd.concat([df_norte, df_sur, df_occ], ignore_index=True)
-
-        # 3. Aplicar anonimización de PII en la columna de documento si existe
-        cols_pii = [col for col in df_citas.columns if "paciente" in col.lower() or "doc" in col.lower() or "cedula" in col.lower()]
-        for col in cols_pii:
-            df_citas[f"{col}_hashed"] = df_citas[col].astype(str).apply(anonimizar_pii)
-
-        # 4. Procesar eventos de WhatsApp (JSONL)
-        eventos_wa = []
-        with open(os.path.join(RUTA_RAW, "whatsapp_eventos.jsonl"), "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    eventos_wa.append(json.loads(line.strip()))
-        df_wa = pd.DataFrame(eventos_wa)
-
-        # Anonimizar teléfonos en WhatsApp
-        if "telefono" in df_wa.columns:
-            df_wa["telefono_hashed"] = df_wa["telefono"].astype(str).apply(anonimizar_pii)
-
-        # 5. Guardar archivos limpios en data/processed/
-        ruta_citas_out = os.path.join(RUTA_PROCESSED, "citas_unificadas_silver.csv")
-        ruta_wa_out = os.path.join(RUTA_PROCESSED, "whatsapp_eventos_silver.csv")
-
-        df_citas.to_csv(ruta_citas_out, index=False, encoding="utf-8")
-        df_wa.to_csv(ruta_wa_out, index=False, encoding="utf-8")
-
-        logger.info(f"Citas procesadas guardadas en: {ruta_citas_out}")
-        logger.info(f"Eventos WhatsApp guardados en: {ruta_wa_out}")
-        logger.info("Procesamiento del Bloque 2 completado con éxito.")
-
-    except Exception as e:
-        logger.error(f"Error durante la transformación: {str(e)}")
+def ejecutar_pipeline_transformacion():
+    os.makedirs(PATH_PROCESSED, exist_ok=True)
+    logger.info("Iniciando pipeline de transformación y unificación para la capa Silver...")
+    
+    df_norte = transformar_ips_norte()
+    df_sur = transformar_ips_sur()
+    df_occidente = transformar_ips_occidente()
+    
+    # Unificación consolidada de citas
+    df_citas_silver = pd.concat([df_norte, df_sur, df_occidente], ignore_index=True)
+    path_citas_out = os.path.join(PATH_PROCESSED, "citas_unificadas_silver.csv")
+    df_citas_silver.to_csv(path_citas_out, index=False)
+    logger.info(f"Citas unificadas guardadas en: {path_citas_out} ({len(df_citas_silver)} registros)")
+    
+    # Procesamiento de WhatsApp
+    df_wa_silver = transformar_whatsapp()
+    path_wa_out = os.path.join(PATH_PROCESSED, "whatsapp_eventos_silver.csv")
+    df_wa_silver.to_csv(path_wa_out, index=False)
+    logger.info(f"Eventos de WhatsApp guardados en: {path_wa_out} ({len(df_wa_silver)} registros)")
 
 if __name__ == "__main__":
-    ejecutar_bloque_2()
+    ejecutar_pipeline_transformacion()
