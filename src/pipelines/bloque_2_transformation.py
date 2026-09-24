@@ -6,15 +6,6 @@ from src.utils.logger import obtener_logger
 
 logger = obtener_logger("Bloque2_Transformation")
 
-PATH_RAW = "data/raw"
-PATH_PROCESSED = "data/processed"
-
-def transformar_ips_norte():
-    file_path = os.path.join(PATH_RAW, "ips_norte_citas.csv")
-    df = pd.read_csv(file_path)
-    df["ips_origen"] = "NORTE"
-    df = df.drop_duplicates(subset=["cita_id", "ips_origen"])
-    return df
 
 def transformar_ips_sur():
     file_path = os.path.join(PATH_RAW, "ips_sur_citas.csv")
